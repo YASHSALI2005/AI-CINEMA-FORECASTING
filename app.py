@@ -213,14 +213,34 @@ def batch_optimize_network(movie_info, selected_date_str, target_cinema_ids, _hi
     
     # 3. Format Results
     df_batch['Raw Prediction'] = preds
-    df_batch['Predicted Sales'] = df_batch['Raw Prediction'].apply(lambda x: f"{int(x*0.85)} - {int(x*1.15)}")
     
-    # Occupancy
-    df_batch['Occupancy'] = ((df_batch['Raw Prediction'] / 300) * 100).clip(upper=100)
-    df_batch['Occupancy'] = df_batch['Occupancy'].apply(lambda x: f"{x:.1f}%")
+    # --- OCCUPANCY & BUCKETS ---
+    # Convert Raw Prediction to % (Assuming 300 seats)
+    df_batch['Pred %'] = ((df_batch['Raw Prediction'] / 300) * 100).clip(upper=100)
+    
+    # Convert Actual Sales to %
+    df_batch['Actual %'] = ((df_batch['Actual Sales'] / 300) * 100).clip(upper=100)
+    
+    # --- DYNAMIC RANGE ---
+    # Instead of static buckets, show +/- 15% relative error range
+    # e.g. Pred 50% -> Range 42% - 58%
+    df_batch['Pred Low'] = ((df_batch['Raw Prediction'] * 0.85 / 300) * 100).clip(upper=100)
+    # User Request: Range calculated as Low to (Low + 20)
+    df_batch['Pred High'] = (df_batch['Pred Low'] + 20).clip(upper=100)
+    
+    # Format Display Columns
+    df_batch['Predicted Sales'] = df_batch.apply(
+        lambda x: f"{x['Pred Low']:.0f}-{x['Pred High']:.0f}%", 
+        axis=1
+    )
+    
+    df_batch['Actual Occupancy'] = df_batch.apply(
+        lambda x: f"{x['Actual %']:.1f}%" if x['Actual Sales'] > 0 else "N/A", 
+        axis=1
+    )
     
     # Cleanup
-    final_df = df_batch[['Cinema ID', 'Time Slot', 'Predicted Sales', 'Actual Sales', 'Occupancy', 'Raw Prediction']]
+    final_df = df_batch[['Cinema ID', 'Time Slot', 'Predicted Sales', 'Actual Occupancy', 'Actual Sales', 'Raw Prediction']]
     
     return final_df
 
@@ -726,10 +746,26 @@ with tab1:
                 
                 pred = max(int(model.predict(input_data)[0]), 0)
                 
+                # Percent & Range
+                pred_pct = (pred / 300) * 100
+                pred_low = (pred * 0.85 / 300) * 100
+                # User Request: High = Low + 20
+                pred_high = min(pred_low + 20, 100)
+                range_str = f"{pred_low:.0f}-{pred_high:.0f}%"
+                
+                # Actuals
+                act = get_actual_sales(history_df, selected_cinema, selected_movie_name, selected_date, h)
+                if act is not None:
+                    act_pct = (act / 300) * 100
+                    act_display = f"{act_pct:.1f}%"
+                else:
+                    act_display = "N/A"
+                
                 results_auto.append({
                     "Slot": slot,
-                    "Predicted Sales": pred,
-                    "Occupancy": f"{(pred/300)*100:.1f}%"
+                    "Predicted Sales": f"{range_str} ({pred_pct:.1f}%)",
+                    "Actual Occupancy": act_display,
+                    "Raw Tickets": pred
                 })
                 progress_auto.progress((i + 1) / len(auto_slots))
                 
