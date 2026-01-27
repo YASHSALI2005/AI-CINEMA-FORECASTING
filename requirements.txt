@@ -1,0 +1,12 @@
+pandas
+xgboost
+joblib
+numpy
+requests
+urllib3
+scikit-learn
+cinemagoer
+streamlit
+sqlalchemy
+mysql-connector-python
+tqdm
