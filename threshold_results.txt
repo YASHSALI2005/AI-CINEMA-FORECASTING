@@ -1,0 +1,13 @@
+Threshold (+/- %)  Matches Accuracy Rate
+               5%      307          6.1%
+              10%      644         12.9%
+              15%      956         19.1%
+              20%     1270         25.4%
+              25%     1583         31.7%
+              30%     1902         38.0%
+              35%     2199         44.0%
+              40%     2477         49.5%
+              50%     2983         59.7%
+
+OBSERVATION:
+Accuracy Rate = Percentage of predictions that fall within the +/- Threshold of the Actual value.
