@@ -6,6 +6,7 @@ import numpy as np
 import requests
 from datetime import datetime
 import re
+from holiday_utils import get_holiday_weight
 # ==========================================
 # 1. CONFIGURATION & LOADING
 # ==========================================
@@ -28,7 +29,7 @@ def load_resources():
     # We NEED this for the Scheduler to find real slots
     # UPDATED: Added 'sold_tickets', 'original_name' for actuals lookup
     history_cols = ['cinema_id', 'show_time', 'sold_tickets', 'original_name']
-    history_df = pd.read_csv("final_training_data_v3.csv", usecols=history_cols)
+    history_df = pd.read_csv("final_training_data_v4.csv", usecols=history_cols)
     history_df['show_time'] = pd.to_datetime(history_df['show_time'])
     
     # --- ADD Normalize Name Column for robust matching ---
@@ -73,6 +74,82 @@ def fetch_poster(movie_title):
     # Reliable Fallback Image if nothing found
     return "https://cdn-icons-png.flaticon.com/512/2503/2503508.png"
 
+
+@st.cache_data
+def fetch_tmdb_movie_details(movie_title):
+    """
+    Fetches full metadata for a movie: Budget, Runtime, Popularity, Vote Average, Release Date, Genres.
+    """
+    clean_title = re.sub(r'\s*\(.*?\)', '', movie_title).strip()
+    
+    try:
+        # 1. Search for Movie ID
+        search_url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={clean_title}"
+        resp = requests.get(search_url, timeout=2)
+        data = resp.json()
+        
+        if not data['results']:
+            return None
+            
+        # --- NEW: Filter for UPCOMING/RECENT Matches only ---
+        today = datetime.today().strftime('%Y-%m-%d')
+        upcoming_results = []
+        for res in data['results']:
+            r_date = res.get('release_date', '0000-00-00')
+            if r_date >= today:
+                upcoming_results.append(res)
+        
+        if not upcoming_results:
+            # Fallback: if no upcoming found, it might be a very fresh release (last 7 days)
+            # Or just check if the top result is at least recent
+            # For strictness: return None or pick the best among search
+            return None
+            
+        # Try exact match among upcoming results first
+        best_match = upcoming_results[0]
+        for res in upcoming_results:
+            if res['title'].lower() == clean_title.lower():
+                best_match = res
+                break
+        
+        movie_id = best_match['id']
+        
+        # 2. Get Full Details
+        details_url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key={TMDB_API_KEY}"
+        resp_det = requests.get(details_url, timeout=2)
+        det_data = resp_det.json()
+        
+        # Extract Genres
+        genres = " | ".join([g['name'] for g in det_data.get('genres', [])])
+        
+        # 3. Get Release Dates (Prioritize INDIA)
+        release_date = det_data.get('release_date') # Default
+        try:
+            rd_url = f"https://api.themoviedb.org/3/movie/{movie_id}/release_dates?api_key={TMDB_API_KEY}"
+            rd_resp = requests.get(rd_url, timeout=2)
+            rd_data = rd_resp.json()
+            
+            for item in rd_data.get('results', []):
+                if item['iso_3166_1'] == 'IN':
+                    # Taking the first/earliest date listed for IN
+                    if item['release_dates']:
+                        release_date = item['release_dates'][0]['release_date'].split('T')[0]
+                    break
+        except:
+            pass # Fallback to default if any error
+
+        return {
+            'release_date': release_date,
+            'budget_usd': det_data.get('budget', 0),
+            'runtime': det_data.get('runtime', 120),
+            'popularity': det_data.get('popularity', 50.0),
+            'vote_average': det_data.get('vote_average', 7.0),
+            'genres': genres
+        }
+        
+    except Exception as e:
+        return None
+
 def format_indian_currency(amount):
     if amount >= 10000000:
         return f"₹{amount/10000000:.1f} Cr"
@@ -80,27 +157,6 @@ def format_indian_currency(amount):
         return f"₹{amount/100000:.1f} L"
     else:
         return f"₹{amount:,.0f}"
-
-def get_star_power(cast_string):
-    if pd.isna(cast_string): return 0
-    mega_stars = ['Shah Rukh Khan', 'Salman Khan', 'Aamir Khan', 'Prabhas',
-                  'Rajinikanth', 'Vijay', 'Allu Arjun', 'Ranbir Kapoor',
-                  'Hrithik Roshan', 'Yash', 'Kamal Haasan', 'Mohanlal',
-                  'Mammootty', 'Deepika Padukone', 'Alia Bhatt']
-    score = 0
-    for actor in [x.strip() for x in str(cast_string).split('|')]:
-        if actor in mega_stars: score += 100
-    return score
-
-def get_holiday_weight(date):
-    date_str = date.strftime('%Y-%m-%d')
-    mega_holidays = ['2024-01-01', '2024-01-26', '2023-08-15', '2024-08-15', 
-                     '2023-10-02', '2024-10-02', '2023-12-25', '2024-12-25']
-    major_festivals = ['2023-11-12', '2024-03-25', '2024-04-11', '2024-06-17', 
-                       '2023-10-24', '2024-10-12']
-    if date_str in mega_holidays: return 10.0
-    if date_str in major_festivals: return 5.0
-    return 1.0
 
 @st.cache_data(show_spinner=False)
 def batch_optimize_network(movie_info, selected_date_str, target_cinema_ids, _history_df, _model, _encoder):
@@ -139,16 +195,23 @@ def batch_optimize_network(movie_info, selected_date_str, target_cinema_ids, _hi
         'log_days_since_release': log_days,
         'movie_trend_7d': movie_info['hype'],
         'cinema_trend_7d': movie_info['status'], # Avg status
-        'star_power': movie_info['star_score']
-    }
+        }
     
     # --- PRE-FETCH ACTUALS ---
     # Filter history once for this movie/date to allow fast lookup
     # Movie name passed in movie_info['clean_title']
     target_clean_name = movie_info.get('clean_title', '')
     
+    
     # Filter by Name
-    mask_name = _history_df['clean_name'] == target_clean_name
+    # FIX: STRICT MATCHING for Actuals too (User Request)
+    # Use 'original_name' if available to ensure we sum only the correct movie format
+    target_original_name = movie_info.get('original_name', '')
+    if target_original_name:
+         mask_name = _history_df['original_name'] == target_original_name
+    else:
+         # Fallback if original_name not passed (legacy)
+         mask_name = _history_df['clean_name'] == target_clean_name
     
     # Filter by Date (Approximate match or exact date?)
     # History has datetime 'show_time'.
@@ -163,13 +226,35 @@ def batch_optimize_network(movie_info, selected_date_str, target_cinema_ids, _hi
     actuals_map = actuals_subset.groupby(['cinema_id', 'hour'])['sold_tickets'].sum().to_dict()
     
     # 1. Build Batch Input
+    # --- STRICT MATCHING: Use exact name only (User Request) ---
+    # Relaxed match removed. Now we only look for the EXACT string from the sidebar.
+    mask_movie = _history_df['original_name'] == movie_info.get('original_name', '')
+    movie_specific_history = _history_df[mask_movie]
+    
     for cid in target_cinema_ids:
         # Candidate Slots logic
-        c_hist = _history_df[_history_df['cinema_id'] == cid]
-        if c_hist.empty:
-             slots = [f"{h}:00" for h in range(9, 24)]
+        # A. Try Specific Movie Slots FOR THIS DATE First (Highest Priority)
+        # Check if we have history for this movie on this specific date
+        m_hist_cin = movie_specific_history[movie_specific_history['cinema_id'] == cid]
+        
+        # Filter for Selected Date
+        date_mask = m_hist_cin['show_time'].dt.date.astype(str) == selected_date_str
+        m_hist_date = m_hist_cin[date_mask]
+        
+        if not m_hist_date.empty:
+             # EXACT DATE MATCH: Use ALL slots from that day (User Request)
+             slots = m_hist_date['show_time'].dt.strftime('%H:%M').unique().tolist()
+        elif not m_hist_cin.empty:
+             # B. Fallback: Movie played here before, but not on this date (Future prediction?)
+             # Use generic Top 20 for this movie
+             slots = m_hist_cin['show_time'].dt.strftime('%H:%M').value_counts().head(20).index.tolist()
         else:
-             slots = c_hist['show_time'].dt.strftime('%H:%M').value_counts().head(5).index.tolist()
+             # C. Fallback: Generic Cinema Slots
+             c_hist = _history_df[_history_df['cinema_id'] == cid]
+             if c_hist.empty:
+                  slots = [f"{h}:00" for h in range(9, 24)]
+             else:
+                  slots = c_hist['show_time'].dt.strftime('%H:%M').value_counts().head(5).index.tolist()
         
         try:
             c_enc = _encoder.transform([str(cid)])[0]
@@ -206,7 +291,7 @@ def batch_optimize_network(movie_info, selected_date_str, target_cinema_ids, _hi
     feature_cols = ['budget', 'runtime', 'popularity', 'vote_average', 'day_of_week', 
                     'is_weekend', 'hour', 'holiday_weight', 'competitors_on_screen', 
                     'log_days_since_release', 'cinema_id_encoded', 'movie_trend_7d', 
-                    'cinema_trend_7d', 'star_power']
+                    'cinema_trend_7d']
                     
     X = df_batch[feature_cols]
     preds = _model.predict(X)
@@ -250,11 +335,11 @@ def get_actual_sales(history_df, cinema_id, movie_name, date_obj, hour):
         # 1. Normalize Input Name
         clean_input = re.sub(r'\s*\(.*?\)', '', movie_name).strip().lower()
         
-        # 2. Define Time Window (+/- 60 mins from the specific hour target)
+        # 2. Define Time Window (+/- 10 mins) to be STRICT about "8 PM" vs "7:45 PM"
         # Target is essentially XX:00 of that date
         target_time = pd.Timestamp(date_obj).replace(hour=hour, minute=0, second=0)
-        start_window = target_time - pd.Timedelta(minutes=60)
-        end_window = target_time + pd.Timedelta(minutes=60)
+        start_window = target_time - pd.Timedelta(minutes=10)
+        end_window = target_time + pd.Timedelta(minutes=10)
         
         mask = (
             (history_df['cinema_id'] == cinema_id) &
@@ -266,9 +351,8 @@ def get_actual_sales(history_df, cinema_id, movie_name, date_obj, hour):
         result = history_df.loc[mask]
         
         if not result.empty:
-            # If multiple shows, take the one closest to target_time? 
-            # Or simplified: Max tickets (assuming the main show is the biggest)
-            return int(result['sold_tickets'].max())
+            # If multiple shows (e.g. Standard + Premium), SUM them
+            return int(result['sold_tickets'].sum())
             
     except Exception as e:
         return None
@@ -308,21 +392,67 @@ selected_movie_name = st.sidebar.selectbox("Select Movie", movie_options)
 
 if selected_movie_name == "➕ Custom New Movie":
     st.sidebar.subheader("🆕 New Movie Details")
-    new_title = st.sidebar.text_input("Title", "Mission Impossible 8")
     
-    # Defaults
-    def_date = datetime.today()
+    # --- AUTO-FILL CALLBACK ---
+    def on_title_change():
+        title = st.session_state.new_title_input
+        if title:
+            details = fetch_tmdb_movie_details(title)
+            if details:
+                # Update Session State Keys directly
+                try:
+                    r_date = datetime.strptime(details['release_date'], '%Y-%m-%d').date()
+                    st.session_state['new_release_date'] = r_date
+                except:
+                    pass
+                
+                # Convert Budget USD -> INR Cr (Approx 84 INR/USD)
+                if details['budget_usd'] > 0:
+                     budget_fn = (details['budget_usd'] * 84) / 10000000
+                     st.session_state['new_budget_cr'] = float(budget_fn)
+                else:
+                     # If TMDB has no budget (0), reset to a safe default and warn user
+                     st.session_state['new_budget_cr'] = 100.0
+                     st.sidebar.warning(f"⚠️ Budget for '{title}' not found in TMDB. Please enter manually.")
+                
+                # Runtime Check
+                if details['runtime'] > 0:
+                    st.session_state['new_runtime'] = int(details['runtime'])
+                else:
+                    st.session_state['new_runtime'] = 120
+                    st.sidebar.warning(f"⚠️ Runtime for '{title}' not found. Defaulting to 120m.")
+                
+                # Rating Check
+                if details['vote_average'] > 0:
+                    st.session_state['new_vote'] = float(details['vote_average'])
+                else:
+                    st.session_state['new_vote'] = 7.0
+                    st.sidebar.warning(f"⚠️ Rating for '{title}' not found. Defaulting to 7.0.")
+
+                st.session_state['new_pop'] = float(details['popularity'])
+                st.session_state['new_genre'] = details['genres']
+                
+                st.toast(f"✅ Auto-filled details for '{title}' from TMDB!")
+
+    # Initialize Session State Keys for Form if not exists
+    if 'new_budget_cr' not in st.session_state: st.session_state['new_budget_cr'] = 100.0
+    if 'new_runtime' not in st.session_state: st.session_state['new_runtime'] = 120
+    if 'new_pop' not in st.session_state: st.session_state['new_pop'] = 50.0
+    if 'new_vote' not in st.session_state: st.session_state['new_vote'] = 7.5
+    if 'new_genre' not in st.session_state: st.session_state['new_genre'] = "Action | Thriller"
+    if 'new_release_date' not in st.session_state: st.session_state['new_release_date'] = datetime.today()
+
+    new_title = st.sidebar.text_input("Title", "Mission Impossible 8", key="new_title_input", on_change=on_title_change)
     
-    new_release_date = st.sidebar.date_input("Release Date", def_date)
+    new_release_date = st.sidebar.date_input("Release Date", key="new_release_date")
     # Input in Crores
-    budget_cr = st.sidebar.number_input("Budget (in Crores)", value=100, step=5, help="Enter budget in Crores (e.g. 100 = 100 Cr)")
+    budget_cr = st.sidebar.number_input("Budget (in Crores)", step=5.0, help="Enter budget in Crores (e.g. 100 = 100 Cr)", key="new_budget_cr")
     new_budget_inr = budget_cr * 10000000
     new_budget_usd = new_budget_inr / 84 # Convert to USD for model features
-    new_runtime = st.sidebar.number_input("Runtime (mins)", value=120) 
-    new_pop = st.sidebar.number_input("Est. Popularity", value=50.0, help="Typical Ranges: 0-10 (Niche), 10-50 (Average), 50-100 (Hit), 100+ (Blockbuster)")
-    new_vote = st.sidebar.slider("Est. Rating", 0.0, 10.0, 7.5)
-    new_cast = st.sidebar.text_input("Top Cast (Pipe | Separated)", "Tom Cruise | Ving Rhames")
-    new_genre = st.sidebar.text_input("Genre", "Action | Thriller")
+    new_runtime = st.sidebar.number_input("Runtime (mins)", key="new_runtime") 
+    new_pop = st.sidebar.number_input("Est. Popularity", help="Typical Ranges: 0-10 (Niche), 10-50 (Average), 50-100 (Hit), 100+ (Blockbuster)", key="new_pop")
+    new_vote = st.sidebar.slider("Est. Rating", 0.0, 10.0, key="new_vote")
+    new_genre = st.sidebar.text_input("Genre", key="new_genre")
 
     # Save Button
     if st.sidebar.button("💾 Save Custom Movie"):
@@ -334,7 +464,6 @@ if selected_movie_name == "➕ Custom New Movie":
                 'runtime': new_runtime,
                 'popularity': new_pop,
                 'vote_average': new_vote,
-                'top_cast': new_cast,
                 'genres': new_genre
             }
              st.session_state['custom_movies_dict'][new_title] = movie_entry
@@ -349,7 +478,6 @@ if selected_movie_name == "➕ Custom New Movie":
         'runtime': new_runtime,
         'popularity': new_pop,
         'vote_average': new_vote,
-        'top_cast': new_cast,
         'genres': new_genre
     }
 
@@ -409,7 +537,7 @@ else:
 competitors = st.sidebar.slider("Competitors on Screen", 0, 10, default_comp, key=f"comp_{scenario}")
 hype_factor = st.sidebar.slider("Hype Trend (Last 7 Days)", 0, 500, default_hype, key=f"hype_{scenario}") 
 cinema_status = st.sidebar.slider("Cinema Status (Last 7 Days)", 0, 500, default_status, key=f"status_{scenario}") 
-weather_cond = st.sidebar.selectbox("Weather Condition", ["Clear", "Rainy (-10%)", "Heavy Storm (-30%)"])
+
 
 # --- F&B CONTROLS ---
 # st.sidebar.markdown("### 🍿 F&B Simulation")
@@ -488,7 +616,6 @@ for cid in target_cinemas:
         'cinema_id_encoded': [c_encoded],
         'movie_trend_7d': [hype_factor],    
         'cinema_trend_7d': [cinema_status],
-        'star_power': [get_star_power(movie_data.get('top_cast', ''))] 
     })
     
     # Predict
@@ -501,10 +628,8 @@ for cid in target_cinemas:
         total_actuals += act
         actuals_found = True
 
-# Apply Weather Penalty to Total
-weather_penalty = 1.0
-if "Rainy" in weather_cond: weather_penalty = 0.9
-if "Heavy Storm" in weather_cond: weather_penalty = 0.7
+
+
 
 # --- FIX: Network Concurrency for 'All' ---
 # "All" sums predictions for 80+ cinemas assuming 100% schedule alignment.
@@ -550,7 +675,7 @@ if selected_cinema == "All":
         network_factor = 0.70 # Dampen by 30%
         actual_active_cinemas = int(len(target_cinemas) * 0.7)
 
-final_prediction = int(total_prediction * weather_penalty * network_factor)
+final_prediction = int(total_prediction * network_factor)
 
 # --- CALC F&B METRICS ---
 # est_fb_revenue = final_prediction * fb_sph
@@ -588,11 +713,7 @@ with col2:
     sub_c1.metric("Days Since Release", f"{days_since} days")
     sub_c2.metric("Competition", f"{competitors} movies")
     
-    star_score = get_star_power(movie_data.get('top_cast', ''))
-    if star_score > 0:
-        st.success(f"✨ **Star Power Detected!** Score: {star_score}")
-
-st.markdown("---")
+    st.markdown("---")
 
 # ==========================================
 # 5. F&B & REVENUE SECTION
@@ -614,7 +735,8 @@ st.markdown("---")
 # ==========================================
 # 6. PERFORMANCE MATCH (MOVED DOWN)
 # ==========================================
-st.markdown("### 🎟️ Performance Match")
+time_label = datetime.strptime(str(selected_hour), "%H").strftime("%I %p").lstrip('0') # 18 -> 6 PM
+st.markdown(f"### 🎟️ Performance Match - {time_label} Show Analysis")
 
 # Range Calculation (e.g. +/- 15%)
 range_pct = 15
@@ -699,7 +821,7 @@ with tab1:
             'hype': hype_factor,
             'status': cinema_status,
             'clean_title': re.sub(r'\s*\(.*?\)', '', selected_movie_name).strip().lower(),
-            'star_score': get_star_power(movie_data.get('top_cast', ''))
+            'original_name': selected_movie_name # ADDED for Strict Matching
         }
         
         # 2. Call Cached Function
@@ -724,14 +846,46 @@ with tab1:
         # ORIGINAL SINGLE OPTIMIZER LOGIC
         if st.button("Find Best Historical Slots"):
             # 1. Get History
-            cinema_history = history_df[history_df['cinema_id'] == selected_cinema]
-            if cinema_history.empty:
-                st.warning("⚠️ No history. Using default 9-11 PM slots.")
-                auto_slots = [f"{h}:00" for h in range(9, 24)]
+            # --- USE REAL MOVIE SLOTS IF AVAILABLE ---
+            clean_title = re.sub(r'\s*\(.*?\)', '', selected_movie_name).strip().lower()
+            
+            # Filter specifically for this movie + cinema
+            # FIX: STRICT MATCHING (User Request)
+            # Use 'original_name' to ensure "WAR 2 (HINDI)" doesn't mix with "WAR 2 (IMAX)"
+            movie_cinema_mask = (history_df['cinema_id'] == selected_cinema) & (
+                history_df['original_name'] == selected_movie_name
+            )
+            movie_slots_df = history_df[movie_cinema_mask]
+            
+            if not movie_slots_df.empty:
+                 # Found history for this Specific Movie
+                 
+                 # LEVEL 1: CHECK FOR EXACT DATE MATCH
+                 selected_date_str = selected_date.strftime('%Y-%m-%d')
+                 date_mask = movie_slots_df['show_time'].dt.date.astype(str) == selected_date_str
+                 movie_date_df = movie_slots_df[date_mask]
+                 
+                 if not movie_date_df.empty:
+                      # EXACT MATCH: Show ALL slots for this date (no limit)
+                      auto_slots = movie_date_df['show_time'].dt.strftime('%H:%M').unique().tolist()
+                      st.toast(f"✅ Showing actual schedule for {selected_date_str}")
+                 else:
+                      # LEVEL 2: Fallback to General Movie History (Top 20)
+                      auto_slots = movie_slots_df['show_time'].dt.strftime('%H:%M').value_counts().head(20).index.tolist()
+                      st.toast(f"⚠️ No shows found for {selected_date_str}, using past typical slots")
+                 
+                 auto_slots = sorted(auto_slots)
+                 
             else:
-                # Smart History Lookback
-                auto_slots = cinema_history['show_time'].dt.strftime('%H:%M').value_counts().head(10).index.tolist()
-                auto_slots = sorted(auto_slots)
+                # FALLBACK: Use Cinema's Generic Popular Slots (For New Movies)
+                cinema_history = history_df[history_df['cinema_id'] == selected_cinema]
+                if cinema_history.empty:
+                    st.warning("⚠️ No history. Using default 9-11 PM slots.")
+                    auto_slots = [f"{h}:00" for h in range(9, 24)]
+                else:
+                    # Smart History Lookback
+                    auto_slots = cinema_history['show_time'].dt.strftime('%H:%M').value_counts().head(10).index.tolist()
+                    auto_slots = sorted(auto_slots)
     
             # 2. Predict
             results_auto = []
@@ -763,9 +917,9 @@ with tab1:
                 
                 results_auto.append({
                     "Slot": slot,
-                    "Predicted Sales": f"{range_str} ({pred_pct:.1f}%)",
+                    "Predicted Sales": f"{range_str} ",
                     "Actual Occupancy": act_display,
-                    "Raw Tickets": pred
+                    "Predicted  Tickets": pred
                 })
                 progress_auto.progress((i + 1) / len(auto_slots))
                 

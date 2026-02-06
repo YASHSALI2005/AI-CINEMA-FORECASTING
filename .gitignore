@@ -1,3 +1,24 @@
 cinepolis_schedule_23_01_2026.sql
-final_training_data_v3.csv
+final_training_data_v4.csv
 final_training_data.csv
+.env
+backup_20260205.sql
+final_training_data_from_dump.csv
+xgb_cinema_model_v4.json
+final_training_data_v4.csv
+final_training_data_v3.csv
+# Datasets
+*.csv
+*.xlsx
+*.sql
+
+# Models
+*.json
+*.pkl
+*.model
+
+# Environment
+.env
+
+# Python
+__pycache__/

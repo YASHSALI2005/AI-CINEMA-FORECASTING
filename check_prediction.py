@@ -29,23 +29,7 @@ SHOW_HOUR = 21
 #  DO NOT EDIT BELOW
 # =============================================================================
 
-def _get_star_power(cast_string):
-    if pd.isna(cast_string):
-        return 0
-    mega = ['Shah Rukh Khan', 'Salman Khan', 'Aamir Khan', 'Prabhas', 'Rajinikanth',
-            'Vijay', 'Allu Arjun', 'Ranbir Kapoor', 'Hrithik Roshan', 'Yash',
-            'Kamal Haasan', 'Mohanlal', 'Mammootty', 'Deepika Padukone', 'Alia Bhatt']
-    return sum(100 for a in str(cast_string).split('|') if a.strip() in mega)
-
-def _get_holiday_weight(date_str):
-    mega = ['2024-01-01', '2024-01-26', '2023-08-15', '2024-08-15',
-            '2023-10-02', '2024-10-02', '2023-12-25', '2024-12-25']
-    major = ['2023-11-12', '2024-03-25', '2024-04-11', '2024-06-17', '2023-10-24', '2024-10-12']
-    if date_str in mega:
-        return 10.0
-    if date_str in major:
-        return 5.0
-    return 1.0
+from holiday_utils import get_holiday_weight
 
 def _normalize_date(s):
     d = pd.to_datetime(s)
@@ -97,8 +81,7 @@ def run():
     sel = pd.to_datetime(DATE)
     days_since = max((sel.normalize() - rel.normalize()).days, 0) if pd.notna(rel) else 0
     log_days = np.log1p(days_since)
-    star = _get_star_power(movie_data.get("top_cast", ""))
-    hw = _get_holiday_weight(date_norm)
+    hw = get_holiday_weight(date_norm)
 
     try:
         cinema_enc = encoder.transform([str(CINEMA_ID)])[0]
@@ -120,7 +103,6 @@ def run():
         "cinema_id_encoded": [cinema_enc],
         "movie_trend_7d": [SCENARIO_MOVIE_HYPE],
         "cinema_trend_7d": [SCENARIO_CINEMA],
-        "star_power": [star],
     })
 
     predicted = max(int(model.predict(X)[0]), 0)
