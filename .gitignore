@@ -7,6 +7,7 @@ final_training_data_from_dump.csv
 xgb_cinema_model_v4.json
 final_training_data_v4.csv
 final_training_data_v3.csv
+final_training_data_10k_v2.xlsx
 # Datasets
 *.csv
 *.xlsx

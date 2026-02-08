@@ -407,8 +407,8 @@ def main():
     end_filter = DATE_RANGES[0][1]
     mask = (combined_df['show_time'] >= start_filter) & (combined_df['show_time'] <= end_filter)
     
-    top_movies = combined_df[mask].groupby('movie_name')['sold_tickets'].sum().sort_values(ascending=False).head(4).index.tolist()
-    print(f"Top 4 Movies: {top_movies}")
+    top_movies = combined_df[mask].groupby('movie_name')['sold_tickets'].sum().sort_values(ascending=False).head(10).index.tolist()
+    print(f"Top 10 Movies: {top_movies}")
     
     for m in top_movies:
         generate_pdf(m, combined_df[combined_df['movie_name'] == m], c_map)
