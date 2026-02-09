@@ -7,23 +7,38 @@ import requests
 from datetime import datetime
 import re
 from holiday_utils import get_holiday_weight
+from dotenv import load_dotenv
+load_dotenv()
+
+import os
+OMDB_API_KEY = os.getenv("OMDB_API_KEY")
+if not OMDB_API_KEY:
+    st.sidebar.error("❌ OMDb API key not found")
+
+
 # ==========================================
 # 1. CONFIGURATION & LOADING
 # ==========================================
 st.set_page_config(page_title="Cinepolis Forecaster", page_icon="🎬", layout="wide")
 
-TMDB_API_KEY = "cfc42745859368e3d9c8252b457b09fb"
+# TMDB Logic Removed
 
 @st.cache_resource
 def load_resources():
     # 1. Load Model & Encoder
     # Assumes you have these V4 files. If not, rename them back to 'final'
+    # 1. Load Model & Encoder
+    # Using the new V5 model with Bollywood Hungama features
     model = xgb.XGBRegressor()
-    model.load_model("xgb_cinema_model_v4.json") 
-    encoder = joblib.load("cinema_encoder_v4.pkl")
+    model.load_model("xgb_cinema_model_v5.json") 
+    encoder = joblib.load("cinema_encoder_v5.pkl")
     
     # 2. Load Metadata (Movies)
-    movies_df = pd.read_csv("movie_features_safe.csv")
+    # Using the enhanced version with Bollywood Hungama data
+    try:
+        movies_df = pd.read_csv("movie_features_with_bh.csv")
+    except:
+        movies_df = pd.read_csv("movie_features_safe.csv")
     
     # 3. Load FULL History (Optimized)
     # We NEED this for the Scheduler to find real slots
@@ -45,110 +60,93 @@ def load_resources():
 
 @st.cache_data
 def fetch_poster(movie_title):
-    # CLEAN THE TITLE: Remove (Hindi), (3D), (Tamil) etc.
-    # "JAWAN (HINDI)" -> "JAWAN"
-    clean_title = re.sub(r'\s*\(.*?\)', '', movie_title).strip()
-    
+    # Use OMDb logic to fetch poster
     try:
-        url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={clean_title}"
-        
-        # --- FIX: Strict exact match first, then loose ---
-        response = requests.get(url, timeout=2)
-        data = response.json()
-        
-        if data['results']:
-            # 1. Try EXACT match first
-            for res in data['results']:
-                if res['title'].lower() == clean_title.lower():
-                     poster_path = res['poster_path']
-                     if poster_path:
-                        return f"https://image.tmdb.org/t/p/original{poster_path}"
-
-            # 2. Fallback to first result if no exact match
-            poster_path = data['results'][0]['poster_path']
-            if poster_path:
-                return f"https://image.tmdb.org/t/p/original{poster_path}"
-                
+        details = fetch_omdb_movie_details(movie_title)
+        if details and details.get('poster') and details.get('poster') != "N/A":
+            return details['poster']
     except:
         pass
     # Reliable Fallback Image if nothing found
     return "https://cdn-icons-png.flaticon.com/512/2503/2503508.png"
 
 
-@st.cache_data
-def fetch_tmdb_movie_details(movie_title):
-    """
-    Fetches full metadata for a movie: Budget, Runtime, Popularity, Vote Average, Release Date, Genres.
-    """
+
+@st.cache_data(show_spinner=False)
+def fetch_omdb_movie_details(movie_title):
     clean_title = re.sub(r'\s*\(.*?\)', '', movie_title).strip()
-    
+
     try:
-        # 1. Search for Movie ID
-        search_url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={clean_title}"
-        resp = requests.get(search_url, timeout=2)
-        data = resp.json()
-        
-        if not data['results']:
+        # 1. Search for matches first (to find NEWEST)
+        search_url = "http://www.omdbapi.com/"
+        search_params = {
+            "s": clean_title,
+            "type": "movie",
+            "apikey": OMDB_API_KEY
+        }
+        resp = requests.get(search_url, params=search_params, timeout=5)
+        search_data = resp.json()
+
+        if search_data.get("Response") != "True":
             return None
-            
-        # --- NEW: Filter for UPCOMING/RECENT Matches only ---
-        today = datetime.today().strftime('%Y-%m-%d')
-        upcoming_results = []
-        for res in data['results']:
-            r_date = res.get('release_date', '0000-00-00')
-            if r_date >= today:
-                upcoming_results.append(res)
         
-        if not upcoming_results:
-            # Fallback: if no upcoming found, it might be a very fresh release (last 7 days)
-            # Or just check if the top result is at least recent
-            # For strictness: return None or pick the best among search
+        results = search_data.get("Search", [])
+        if not results:
             return None
-            
-        # Try exact match among upcoming results first
-        best_match = upcoming_results[0]
-        for res in upcoming_results:
-            if res['title'].lower() == clean_title.lower():
-                best_match = res
-                break
-        
-        movie_id = best_match['id']
-        
-        # 2. Get Full Details
-        details_url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key={TMDB_API_KEY}"
-        resp_det = requests.get(details_url, timeout=2)
-        det_data = resp_det.json()
-        
-        # Extract Genres
-        genres = " | ".join([g['name'] for g in det_data.get('genres', [])])
-        
-        # 3. Get Release Dates (Prioritize INDIA)
-        release_date = det_data.get('release_date') # Default
-        try:
-            rd_url = f"https://api.themoviedb.org/3/movie/{movie_id}/release_dates?api_key={TMDB_API_KEY}"
-            rd_resp = requests.get(rd_url, timeout=2)
-            rd_data = rd_resp.json()
-            
-            for item in rd_data.get('results', []):
-                if item['iso_3166_1'] == 'IN':
-                    # Taking the first/earliest date listed for IN
-                    if item['release_dates']:
-                        release_date = item['release_dates'][0]['release_date'].split('T')[0]
-                    break
-        except:
-            pass # Fallback to default if any error
+
+        # 2. Sort by Year (Descending) to get the LATEST one
+        def get_year(item):
+            y_str = item.get('Year', '0')
+            match = re.search(r'\d{4}', y_str)
+            return int(match.group(0)) if match else 0
+
+        # Prioritize Year Descending Only
+        # For "Dune", this picks "Dune: Part Two" (2024) over "Dune" (1984)
+        # For "Cold Storage", this picks "Cold Storage" (2016) over "Cold Storage" (2009)
+        best_match = sorted(results, key=get_year, reverse=True)[0]
+
+        imdb_id = best_match['imdbID']
+
+        # 3. Fetch Full Details using ID
+        details_url = "http://www.omdbapi.com/"
+        details_params = {
+            "i": imdb_id,
+            "apikey": OMDB_API_KEY
+        }
+        resp_det = requests.get(details_url, params=details_params, timeout=5)
+        data = resp_det.json()
+
+        runtime_raw = data.get("Runtime")
+        rating_raw = data.get("imdbRating")
+        votes_raw = data.get("imdbVotes")
+        boxoffice_raw = data.get("BoxOffice")
 
         return {
-            'release_date': release_date,
-            'budget_usd': det_data.get('budget', 0),
-            'runtime': det_data.get('runtime', 120),
-            'popularity': det_data.get('popularity', 50.0),
-            'vote_average': det_data.get('vote_average', 7.0),
-            'genres': genres
+            "release_date": data.get("Released"),
+
+            "runtime": int(runtime_raw.replace(" min", "")) if runtime_raw not in ["N/A", None] else 120,
+            "runtime_missing": runtime_raw in ["N/A", None],
+
+            "vote_average": float(rating_raw) if rating_raw not in ["N/A", None] else 7.0,
+            "rating_missing": rating_raw in ["N/A", None],
+
+            "popularity": int(int(votes_raw.replace(",", "")) / 5000) if votes_raw not in ["N/A", None] else 50,
+            "popularity_missing": votes_raw in ["N/A", None],
+
+            "budget_usd": int(boxoffice_raw.replace("$", "").replace(",", "")) if boxoffice_raw not in ["N/A", None] else 0,
+            "budget_missing": boxoffice_raw in ["N/A", None],
+
+            "genres": data.get("Genre", "Unknown"),
+            "poster": data.get("Poster"),
+            "imdb_id": data.get("imdbID")
         }
-        
-    except Exception as e:
+
+
+    except Exception:
         return None
+
+
+# TMDB fetch function removed
 
 def format_indian_currency(amount):
     if amount >= 10000000:
@@ -183,6 +181,23 @@ def batch_optimize_network(movie_info, selected_date_str, target_cinema_ids, _hi
     batch_rows = []
     
     # Pre-calculated features
+    # BH Verdict Mapping
+    verdict_map = {
+        'All Time Blockbuster': 5,
+        'Blockbuster': 4,
+        'Super Hit': 3,
+        'Hit': 2,
+        'Semi Hit': 1,
+        'Average': 0,
+        'Below Average': -1,
+        'Flop': -2,
+        'Disaster': -3,
+        'Unknown': 0
+    }
+    bh_verdict = movie_info.get('bh_verdict', 'Unknown')
+    bh_score = verdict_map.get(bh_verdict, 0)
+    
+    # Pre-calculated features
     base_feat = {
         'budget': movie_info['budget'],
         'runtime': movie_info['runtime'],
@@ -191,10 +206,13 @@ def batch_optimize_network(movie_info, selected_date_str, target_cinema_ids, _hi
         'day_of_week': day_of_week,
         'is_weekend': is_weekend,
         'holiday_weight': holiday_w, 
-        'competitors_on_screen': movie_info['competitors'], # Passed in movie_info
+        'competitors_on_screen': movie_info.get('competitors_on_screen', 0), # Fallback 0
         'log_days_since_release': log_days,
-        'movie_trend_7d': movie_info['hype'],
-        'cinema_trend_7d': movie_info['status'], # Avg status
+        'cinema_id_encoded': 0, # Placeholder, set in loop
+        'movie_trend_7d': movie_info.get('movie_trend_7d', 0), # Fallback
+        'cinema_trend_7d': movie_info.get('cinema_trend_7d', 0), # Fallback
+        'bh_opening_day': movie_info.get('bh_opening_day', 0),
+        'bh_verdict_score': bh_score
         }
     
     # --- PRE-FETCH ACTUALS ---
@@ -291,7 +309,7 @@ def batch_optimize_network(movie_info, selected_date_str, target_cinema_ids, _hi
     feature_cols = ['budget', 'runtime', 'popularity', 'vote_average', 'day_of_week', 
                     'is_weekend', 'hour', 'holiday_weight', 'competitors_on_screen', 
                     'log_days_since_release', 'cinema_id_encoded', 'movie_trend_7d', 
-                    'cinema_trend_7d']
+                    'cinema_trend_7d', 'bh_opening_day', 'bh_verdict_score']
                     
     X = df_batch[feature_cols]
     preds = _model.predict(X)
@@ -373,6 +391,8 @@ except Exception as e:
 # 2. SIDEBAR - CONTROLS
 # ==========================================
 st.sidebar.header("🎛️ Simulation Controls")
+# 
+
 
 # --- SESSION STATE FOR CUSTOM MOVIES ---
 if 'custom_movies_dict' not in st.session_state:
@@ -395,44 +415,126 @@ if selected_movie_name == "➕ Custom New Movie":
     
     # --- AUTO-FILL CALLBACK ---
     def on_title_change():
-        title = st.session_state.new_title_input
-        if title:
-            details = fetch_tmdb_movie_details(title)
-            if details:
-                # Update Session State Keys directly
-                try:
-                    r_date = datetime.strptime(details['release_date'], '%Y-%m-%d').date()
-                    st.session_state['new_release_date'] = r_date
-                except:
-                    pass
-                
-                # Convert Budget USD -> INR Cr (Approx 84 INR/USD)
-                if details['budget_usd'] > 0:
-                     budget_fn = (details['budget_usd'] * 84) / 10000000
-                     st.session_state['new_budget_cr'] = float(budget_fn)
-                else:
-                     # If TMDB has no budget (0), reset to a safe default and warn user
-                     st.session_state['new_budget_cr'] = 100.0
-                     st.sidebar.warning(f"⚠️ Budget for '{title}' not found in TMDB. Please enter manually.")
-                
-                # Runtime Check
-                if details['runtime'] > 0:
-                    st.session_state['new_runtime'] = int(details['runtime'])
-                else:
-                    st.session_state['new_runtime'] = 120
-                    st.sidebar.warning(f"⚠️ Runtime for '{title}' not found. Defaulting to 120m.")
-                
-                # Rating Check
-                if details['vote_average'] > 0:
-                    st.session_state['new_vote'] = float(details['vote_average'])
-                else:
-                    st.session_state['new_vote'] = 7.0
-                    st.sidebar.warning(f"⚠️ Rating for '{title}' not found. Defaulting to 7.0.")
 
-                st.session_state['new_pop'] = float(details['popularity'])
-                st.session_state['new_genre'] = details['genres']
-                
-                st.toast(f"✅ Auto-filled details for '{title}' from TMDB!")
+        title = st.session_state.new_title_input
+        if not title:
+            return
+
+        details = fetch_omdb_movie_details(title)
+        missing_fields = []
+
+        if details.get("budget_missing"):
+            missing_fields.append("💰 Budget")
+
+        if details.get("runtime_missing"):
+            missing_fields.append("⏱️ Runtime")
+
+        if details.get("popularity_missing"):
+            missing_fields.append("🔥 Popularity")
+
+        if details.get("rating_missing"):
+            missing_fields.append("⭐ Rating")
+
+        if missing_fields:
+            st.sidebar.warning(
+                "⚠️ OMDb missing data for:\n"
+                + ", ".join(missing_fields)
+                + "\n\nDefault values were applied. Please verify manually."
+            )
+
+
+        if details is None:
+            st.sidebar.warning(
+                "⚠️ OMDb metadata unavailable.\n"
+                "Auto-fill disabled — please enter details manually."
+            )
+            return
+
+# TMDB release date fetch removed
+
+        # Release date
+        try:
+            # Try YYYY-MM-DD first (TMDB format)
+            r_date = datetime.strptime(details['release_date'], '%Y-%m-%d').date()
+            st.session_state['new_release_date'] = r_date
+        except:
+            try:
+                # Fallback to OMDb format (05 Dec 2025)
+                r_date = datetime.strptime(details['release_date'], '%d %b %Y').date()
+                st.session_state['new_release_date'] = r_date
+            except:
+                pass
+
+        # Budget (USD → INR Cr)
+        if details['budget_usd'] > 0:
+            st.session_state['new_budget_cr'] = (details['budget_usd'] * 84) / 1e7
+        else:
+            st.session_state['new_budget_cr'] = 100.0
+
+        # Runtime
+        st.session_state['new_runtime'] = details['runtime']
+
+        # Rating
+        st.session_state['new_vote'] = details['vote_average']
+
+        # Popularity (proxy)
+        st.session_state['new_pop'] = details['popularity']
+
+        # Genre
+        st.session_state['new_genre'] = details['genres']
+        
+        # Poster
+        st.session_state['new_poster'] = details.get('poster')
+
+        st.toast(f"✅ Auto-filled details for '{title}' (via OMDb)")
+
+
+    # title = st.session_state.new_title_input
+    # if not title:
+    #     return
+
+    # details = fetch_omdb_movie_details(title)
+
+    # if details is None:
+    #     st.sidebar.warning(
+    #         "⚠️ Movie details not found via OMDb.\n"
+    #         "Please enter values manually."
+    #     )
+    #     return
+
+    # # 🔴 TMDB BLOCKED / FAILED
+    # if details is None:
+    #     st.sidebar.warning(
+    #         "🚫 TMDB is blocked on this network.\n"
+    #         "Auto-fill disabled — please enter details manually."
+    #     )
+    #     return
+
+    # # ✅ TMDB SUCCESS
+    # try:
+    #     r_date = datetime.strptime(details['release_date'], '%Y-%m-%d').date()
+    #     st.session_state['new_release_date'] = r_date
+    # except:
+    #     pass
+
+    # # Budget
+    # if details['budget_usd'] > 0:
+    #     st.session_state['new_budget_cr'] = (details['budget_usd'] * 84) / 1e7
+    # else:
+    #     st.session_state['new_budget_cr'] = 100.0
+    #     st.sidebar.warning("⚠️ Budget not available on TMDB.")
+
+    # # Runtime
+    # st.session_state['new_runtime'] = details.get('runtime', 120)
+
+    # # Rating
+    # st.session_state['new_vote'] = details.get('vote_average', 7.0)
+
+    # # Popularity & Genre
+    # st.session_state['new_pop'] = details.get('popularity', 50.0)
+    # st.session_state['new_genre'] = details.get('genres', 'Unknown')
+
+    # st.toast(f"✅ Auto-filled details for '{title}'")
 
     # Initialize Session State Keys for Form if not exists
     if 'new_budget_cr' not in st.session_state: st.session_state['new_budget_cr'] = 100.0
@@ -442,7 +544,14 @@ if selected_movie_name == "➕ Custom New Movie":
     if 'new_genre' not in st.session_state: st.session_state['new_genre'] = "Action | Thriller"
     if 'new_release_date' not in st.session_state: st.session_state['new_release_date'] = datetime.today()
 
-    new_title = st.sidebar.text_input("Title", "Mission Impossible 8", key="new_title_input", on_change=on_title_change)
+    new_title = st.sidebar.text_input(
+        "Title",
+        "Dune",
+        key="new_title_input"
+    )
+
+    if new_title:
+        on_title_change()
     
     new_release_date = st.sidebar.date_input("Release Date", key="new_release_date")
     # Input in Crores
@@ -464,7 +573,8 @@ if selected_movie_name == "➕ Custom New Movie":
                 'runtime': new_runtime,
                 'popularity': new_pop,
                 'vote_average': new_vote,
-                'genres': new_genre
+                'genres': new_genre,
+                'poster': st.session_state.get('new_poster')
             }
              st.session_state['custom_movies_dict'][new_title] = movie_entry
              st.session_state['last_saved_movie'] = new_title
@@ -472,14 +582,16 @@ if selected_movie_name == "➕ Custom New Movie":
 
     # Create a dictionary acting as the row (preview)
     movie_data = {
-        'original_name': new_title,
-        'release_date': new_release_date, 
-        'budget': new_budget_usd,
-        'runtime': new_runtime,
-        'popularity': new_pop,
-        'vote_average': new_vote,
-        'genres': new_genre
-    }
+    'original_name': new_title,
+    'release_date': new_release_date,
+    'budget': new_budget_usd,
+    'runtime': new_runtime,
+    'popularity': new_pop,
+    'vote_average': new_vote,
+    'genres': new_genre,
+    'poster': st.session_state.get('new_poster')  # ✅ THIS LINE
+}
+
 
 elif selected_movie_name in st.session_state['custom_movies_dict']:
     # Load from Session State
@@ -499,7 +611,21 @@ selected_movie_name = movie_data['original_name']
 
 # --- MOVED: Title & Cinema Selector to Main Area ---
 st.title("🎬 AI Cinema Forecaster")
-st.markdown("### Predicting Occupancy with XGBoost & TMDB Metadata")
+st.markdown("### Predicting Occupancy with XGBoost & BH-Enriched Metadata")
+
+# --- BOLLYWOOD HUNGAMA INSIGHTS ---
+if 'bh_opening_day' in movie_data and movie_data['bh_opening_day'] > 0:
+    st.markdown("#### 🇮🇳 Bollywood Hungama Insights")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Opening Day (Cr)", f"₹{movie_data['bh_opening_day']}")
+    with c2:
+        st.metric("Opening Weekend (Cr)", f"₹{movie_data['bh_opening_weekend']}")
+    with c3:
+        st.metric("Lifetime (Cr)", f"₹{movie_data['bh_lifetime']}")
+    with c4:
+        st.metric("Verdict", movie_data['bh_verdict'])
+    st.markdown("---")
 
 # Main Screen Cinema Selector
 # --- UPDATE: Add 'All' Option ---
@@ -549,6 +675,20 @@ cinema_status = st.sidebar.slider("Cinema Status (Last 7 Days)", 0, 500, default
 # ==========================================
 # 3. PREDICTION ENGINE
 # ==========================================
+# BH Verdict Mapping (Global for this block)
+verdict_map = {
+    'All Time Blockbuster': 5,
+    'Blockbuster': 4,
+    'Super Hit': 3,
+    'Hit': 2,
+    'Semi Hit': 1,
+    'Average': 0,
+    'Below Average': -1,
+    'Flop': -2,
+    'Disaster': -3,
+    'Unknown': 0
+}
+
 day_of_week = selected_date.weekday()
 is_weekend = 1 if day_of_week >= 5 else 0
 is_holiday = 0 
@@ -616,6 +756,8 @@ for cid in target_cinemas:
         'cinema_id_encoded': [c_encoded],
         'movie_trend_7d': [hype_factor],    
         'cinema_trend_7d': [cinema_status],
+        'bh_opening_day': movie_data.get('bh_opening_day', 0),
+        'bh_verdict_score': verdict_map.get(movie_data.get('bh_verdict', 'Unknown'), 0)
     })
     
     # Predict
@@ -683,7 +825,9 @@ final_prediction = int(total_prediction * network_factor)
 # ticket_revenue = final_prediction * 250 
 # total_revenue = ticket_revenue + est_fb_revenue
 
-poster_url = fetch_poster(selected_movie_name)
+poster_url = movie_data.get('poster')
+if not poster_url or poster_url == "N/A":
+    poster_url = fetch_poster(selected_movie_name)
 
 # ==========================================
 # 4. MAIN UI
