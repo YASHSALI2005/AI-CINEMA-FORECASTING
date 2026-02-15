@@ -74,18 +74,31 @@ def fetch_poster(movie_title):
 
 @st.cache_data(show_spinner=False)
 def fetch_omdb_movie_details(movie_title):
+    # Extract year from parentheses if provided (e.g. "Toxic (2026)" -> year=2026)
+    year_match = re.search(r'\((\d{4})\)', movie_title)
+    target_year = int(year_match.group(1)) if year_match else None
+    
     clean_title = re.sub(r'\s*\(.*?\)', '', movie_title).strip()
 
     try:
-        # 1. Search for matches first (to find NEWEST)
+        # 1. Search OMDb (pass year if available for better results)
         search_url = "http://www.omdbapi.com/"
         search_params = {
             "s": clean_title,
             "type": "movie",
             "apikey": OMDB_API_KEY
         }
+        if target_year:
+            search_params["y"] = target_year  # OMDb year filter
+        
         resp = requests.get(search_url, params=search_params, timeout=5)
         search_data = resp.json()
+
+        # If year-filtered search found nothing, retry WITHOUT year filter
+        if search_data.get("Response") != "True" and target_year:
+            search_params.pop("y")
+            resp = requests.get(search_url, params=search_params, timeout=5)
+            search_data = resp.json()
 
         if search_data.get("Response") != "True":
             return None
@@ -94,16 +107,47 @@ def fetch_omdb_movie_details(movie_title):
         if not results:
             return None
 
-        # 2. Sort by Year (Descending) to get the LATEST one
+        # 2. Filter: Only keep results whose title closely matches the search
+        def is_title_match(search_term, result_title):
+            s = search_term.lower().strip()
+            r = result_title.lower().strip()
+            # Exact match
+            if s == r:
+                return True
+            # Result starts with search (e.g. "Toxic" matches "Toxic: A Fairy Tale")
+            if r.startswith(s + " ") or r.startswith(s + ":"):
+                return True
+            # Search starts with result (e.g. "Dhurandhar The Revenge" matches "Dhurandhar")
+            if s.startswith(r + " ") or s.startswith(r + ":"):
+                return True
+            return False
+
+        filtered = [r for r in results if is_title_match(clean_title, r['Title'])]
+        if not filtered:
+            return None  # No close title match found
+
+        # 3. If user specified a year, try to find that exact year first
         def get_year(item):
             y_str = item.get('Year', '0')
             match = re.search(r'\d{4}', y_str)
             return int(match.group(0)) if match else 0
 
-        # Prioritize Year Descending Only
-        # For "Dune", this picks "Dune: Part Two" (2024) over "Dune" (1984)
-        # For "Cold Storage", this picks "Cold Storage" (2016) over "Cold Storage" (2009)
-        best_match = sorted(results, key=get_year, reverse=True)[0]
+        if target_year:
+            year_matches = [r for r in filtered if get_year(r) == target_year]
+            if year_matches:
+                # Found the exact year — pick exact title match if possible
+                best_match = sorted(year_matches, 
+                    key=lambda i: (2 if i['Title'].lower().strip() == clean_title.lower() else 1),
+                    reverse=True)[0]
+            else:
+                # User asked for 2026 but OMDb only has 2008 — movie not in OMDb yet
+                return None
+        else:
+            # No year specified — pick best by (exact match priority, newest year)
+            def sort_key(item):
+                is_exact = 2 if item['Title'].lower().strip() == clean_title.lower() else 1
+                return (is_exact, get_year(item))
+            best_match = sorted(filtered, key=sort_key, reverse=True)[0]
 
         imdb_id = best_match['imdbID']
 
@@ -424,9 +468,14 @@ if selected_movie_name == "➕ Custom New Movie":
 
         if details is None:
             st.sidebar.warning(
-                "⚠️ OMDb metadata unavailable.\n"
-                "Auto-fill disabled — please enter details manually."
+                "⚠️ Movie not found on OMDb (upcoming/unreleased?).\n"
+                "Please enter details manually:\n"
+                "• Budget: Check trade estimates\n"
+                "• Runtime: ~130-150 mins (typical)\n"
+                "• Rating: 7.0-8.0 (expected)\n"
+                "• Popularity: 50-200 (based on buzz)"
             )
+            st.session_state['new_poster'] = None  # Clear old poster
             return
 
         missing_fields = []
