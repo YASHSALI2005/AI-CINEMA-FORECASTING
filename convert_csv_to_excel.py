@@ -1,8 +1,8 @@
 import pandas as pd
 import os
 
-CSV_FILE = "final_training_data_v4.csv"
-OUTPUT_FILE = "final_training_data_10k_v3.xlsx"
+CSV_FILE = "final_training_data_from_dump.csv"
+OUTPUT_FILE = "final_training_data_10k_v4.xlsx"
 ROWS_TO_READ = 10000
 
 def convert():

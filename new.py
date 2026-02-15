@@ -17,6 +17,7 @@ MODEL_FILE = "xgb_cinema_model_v5.json"
 ENCODER_FILE = "cinema_encoder_v5.pkl"
 
 # --- MANUAL RELEASE DATES (STRICT OVERRIDE) ---
+# Format: "YYYY-MM-DD"
 MANUAL_RELEASE_DATES = {
     "BORDER 2 (HINDI)": "2026-01-23",
     "DHURANDHAR (HINDI)": "2025-12-05"
@@ -24,25 +25,20 @@ MANUAL_RELEASE_DATES = {
 
 # --- 100% DATA-DRIVEN TREND LOGIC ---
 def calculate_data_driven_trends(df, reference_date):
+    # Define the 7-day window BEFORE the reference date
     start_window = reference_date - timedelta(days=7)
     end_window = reference_date
     
+    # Filter data for the last 7 days
     mask = (df['show_time'] >= start_window) & (df['show_time'] < end_window)
     recent_data = df[mask].copy()
     
     if recent_data.empty:
         recent_data = df.copy()
 
-    # --- KEY FIX 1: Aggregate sales per show first ---
-    # We sum sales for the same show (handling split ticket types)
-    # so that "Average Sales" reflects the WHOLE show, not just one section.
-    recent_agg = recent_data.groupby(['cinema_id', 'show_time', 'movie_name'], as_index=False)['sold_tickets'].sum()
-
-    movie_hype = recent_agg.groupby('movie_name')['sold_tickets'].mean().to_dict()
-    # For cinema status, we also use the aggregated total sales per show
-    cinema_status = recent_agg.groupby('cinema_id')['sold_tickets'].mean().to_dict()
-    
-    global_avg = recent_agg['sold_tickets'].mean()
+    movie_hype = recent_data.groupby('movie_name')['sold_tickets'].mean().to_dict()
+    cinema_status = recent_data.groupby('cinema_id')['sold_tickets'].mean().to_dict()
+    global_avg = recent_data['sold_tickets'].mean()
     
     return movie_hype, cinema_status, global_avg
 
@@ -56,12 +52,6 @@ def load_resources():
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
         return None, None, None, None
-
-    # Ensure critical new columns exist even if older CSV is used
-    if 'bh_opening_day' not in df.columns:
-        df['bh_opening_day'] = 0
-    if 'bh_verdict_score' not in df.columns:
-        df['bh_verdict_score'] = 0
 
     try:
         c_names = pd.read_csv(CINEMA_NAMES_FILE)
@@ -124,6 +114,7 @@ def prepare_features(df, encoder):
     return df
 
 def generate_grid_schedule_vectorized(movie_name, movie_meta, unique_cinemas, start_dt, end_dt):
+    # Ensure inputs are Datetime objects
     start_dt = pd.to_datetime(start_dt)
     end_dt = pd.to_datetime(end_dt)
 
@@ -153,40 +144,16 @@ def generate_grid_schedule_vectorized(movie_name, movie_meta, unique_cinemas, st
 def process_movie_excel(movie_name, df_full, model, encoder, c_map):
     print(f"Processing Excel for: {movie_name} ...")
     
-    movie_slice = df_full[df_full['movie_name'] == movie_name].copy()
+    movie_slice = df_full[df_full['movie_name'] == movie_name]
+    # Even if movie not in CSV, we might want to generate hypothetical forecast
+    # But we need metadata. If empty, we can't do much.
     if movie_slice.empty: 
-        print(f"   [!] Movie '{movie_name}' not found. Skipping.")
+        print(f"   [!] Movie '{movie_name}' not found in data. Skipping.")
         return
-
-    # --- KEY FIX 2: CORRECTLY HANDLE SPLIT TICKETS ---
-    movie_slice['show_time'] = pd.to_datetime(movie_slice['show_time'])
     
-    # We GROUP BY Cinema + Time and SUM the sales.
-    # This combines "Standard" + "Premium" rows into one correct row.
-    # We take MAX capacity because the hall size doesn't double, it stays same.
-    # We keep the first value for metadata like budget, runtime etc.
-    agg_rules = {
-        'sold_tickets': 'sum',
-        'capacity': 'max',
-        'budget': 'first',
-        'runtime': 'first',
-        'popularity': 'first',
-        'vote_average': 'first',
-        'release_date': 'first',
-        'competitors_on_screen': 'first',
-        'bh_opening_day': 'first',
-        'bh_verdict_score': 'first'
-    }
+    meta_row = movie_slice.sort_values('show_time', ascending=False).iloc[0]
     
-    # Perform Aggregation
-    movie_slice_agg = movie_slice.groupby(['cinema_id', 'show_time'], as_index=False).agg(agg_rules)
-    
-    print(f"   [i] Aggregated {len(movie_slice)} ticket rows into {len(movie_slice_agg)} unique shows.")
-    
-    # Use the aggregated slice for extracting metadata
-    meta_row = movie_slice_agg.iloc[0]
-    
-    # --- DATE SELECTION ---
+    # --- DATE SELECTION LOGIC ---
     if movie_name in MANUAL_RELEASE_DATES:
         start_date = pd.to_datetime(MANUAL_RELEASE_DATES[movie_name])
         print(f"   -> !!! USING MANUAL OVERRIDE DATE: {start_date.date()} !!!")
@@ -194,8 +161,10 @@ def process_movie_excel(movie_name, df_full, model, encoder, c_map):
         release_date_raw = meta_row.get('release_date', None)
         if pd.isna(release_date_raw):
             start_date = pd.to_datetime(datetime.now().date())
+            print(f"   -> [!] No date found. Defaulting to Today: {start_date.date()}")
         else:
             start_date = pd.to_datetime(release_date_raw)
+            print(f"   -> Using CSV Date: {start_date.date()}")
 
     end_date = start_date + timedelta(days=15)
     print(f"   -> Grid Range: {start_date.date()} to {end_date.date()}")
@@ -209,14 +178,14 @@ def process_movie_excel(movie_name, df_full, model, encoder, c_map):
         'runtime': meta_row.get('runtime', 0),
         'popularity': meta_row.get('popularity', 0),
         'vote_average': meta_row.get('vote_average', 0),
-        'release_date': start_date,
+        'release_date': start_date, # Explicitly passed
         'competitors_on_screen': meta_row.get('competitors_on_screen', 0),
         'movie_trend_7d': specific_movie_trend, 
         'bh_opening_day': meta_row.get('bh_opening_day', 0),
         'bh_verdict_score': meta_row.get('bh_verdict_score', 0)
     }
     
-    unique_cinemas = movie_slice_agg['cinema_id'].unique()
+    unique_cinemas = movie_slice['cinema_id'].unique()
     cinema_capacity_map = df_full.groupby('cinema_id')['capacity'].median().to_dict()
     
     # 2. Grid Generation
@@ -241,11 +210,11 @@ def process_movie_excel(movie_name, df_full, model, encoder, c_map):
     high_val = (grid_df['base_pct'] + 20).clip(upper=100).round().astype(int)
     grid_df['Pred Range'] = low_val.astype(str) + "-" + high_val.astype(str) + "%"
 
-    # 4. Actuals Merge (Using AGGREGATED Slice)
-    actuals = movie_slice_agg.copy()
+    # 4. Actuals Merge
+    actuals = movie_slice.copy()
+    actuals['show_time'] = pd.to_datetime(actuals['show_time'])
     actuals['rounded_time'] = actuals['show_time'].apply(round_time_to_nearest_30)
     
-    # Sales are already summed, capacity is already maxed. Just calc %.
     actuals['capacity'] = pd.to_numeric(actuals['capacity'], errors='coerce').fillna(300)
     actuals['sold_tickets'] = pd.to_numeric(actuals['sold_tickets'], errors='coerce').fillna(0)
     actuals['actual_pct'] = (actuals['sold_tickets'] / actuals['capacity']) * 100
@@ -253,8 +222,6 @@ def process_movie_excel(movie_name, df_full, model, encoder, c_map):
     
     actuals_subset = actuals[['rounded_time', 'cinema_id', 'actual_pct']].copy()
     actuals_subset.columns = ['show_time', 'cinema_id', 'Actual %']
-    
-    # Group again by rounded time just in case rounding creates collisions
     actuals_subset = actuals_subset.groupby(['show_time', 'cinema_id'], as_index=False).max()
     
     final_df = pd.merge(grid_df, actuals_subset, on=['show_time', 'cinema_id'], how='left')
@@ -277,9 +244,14 @@ def process_movie_excel(movie_name, df_full, model, encoder, c_map):
     clean_title = re.sub(r'[\\/*?:\'\"<>|]', "", movie_name).replace(" ", "_")[:30]
     fname = f"Pred_{clean_title}.xlsx"
     
+    # Auto-delete old file to avoid confusion
     if os.path.exists(fname):
-        try: os.remove(fname)
-        except: pass
+        try:
+            os.remove(fname)
+            print(f"   -> Deleted old file: {fname}")
+        except PermissionError:
+            print(f"   [!] WARNING: Cannot delete {fname}. It is OPEN.")
+            input("   >>> Please CLOSE the Excel file and press ENTER...")
 
     while True:
         try:
@@ -296,7 +268,9 @@ def main():
 
     df['show_time'] = pd.to_datetime(df['show_time'])
     
+    # Keys must match MANUAL_RELEASE_DATES exactly
     target_movies = ["DHURANDHAR (HINDI)", "BORDER 2 (HINDI)"]
+    
     print(f"Targets: {target_movies}")
     print("-" * 50)
     

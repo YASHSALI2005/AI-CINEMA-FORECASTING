@@ -421,6 +421,14 @@ if selected_movie_name == "➕ Custom New Movie":
             return
 
         details = fetch_omdb_movie_details(title)
+
+        if details is None:
+            st.sidebar.warning(
+                "⚠️ OMDb metadata unavailable.\n"
+                "Auto-fill disabled — please enter details manually."
+            )
+            return
+
         missing_fields = []
 
         if details.get("budget_missing"):
@@ -443,12 +451,6 @@ if selected_movie_name == "➕ Custom New Movie":
             )
 
 
-        if details is None:
-            st.sidebar.warning(
-                "⚠️ OMDb metadata unavailable.\n"
-                "Auto-fill disabled — please enter details manually."
-            )
-            return
 
 # TMDB release date fetch removed
 

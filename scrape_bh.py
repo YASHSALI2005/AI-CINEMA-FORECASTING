@@ -127,7 +127,7 @@ def scrape_movie_details(movie_name, url):
         print(f"❌ Error scraping {movie_name}: {e}")
         return None
 
-def run_scraper(years=[2024, 2025, 2026], output_file='bh_box_office_data.json'):
+def run_scraper(years=[2023, 2024, 2025, 2026], output_file='bh_box_office_data.json'):
     all_data = []
     
     # Load existing if available to avoid redundant work
