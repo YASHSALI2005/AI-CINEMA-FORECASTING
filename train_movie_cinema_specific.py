@@ -113,6 +113,7 @@ def prepare_features_unified(df_input, cinema_encoder=None, movie_encoder=None):
     df['day_of_week'] = df['show_time'].dt.dayofweek
     df['is_weekend'] = df['day_of_week'].isin([4, 5, 6]).astype(int)
     df['hour'] = df['show_time'].dt.hour
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['date_str'] = df['show_time'].dt.date.astype(str)
 
     if 'release_date' in df.columns:
@@ -164,7 +165,7 @@ def train_unified_model(df_train):
     df_prepped, cinema_encoder, movie_encoder = prepare_features_unified(df_train)
 
     features = [
-        'day_of_week', 'is_weekend', 'hour',
+        'day_of_week', 'is_weekend', 'hour_cos',
         'log_days_since_release',
         'cinema_id_encoded', 'movie_id_encoded',
         'competitors_on_screen',
