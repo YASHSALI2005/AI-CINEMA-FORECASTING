@@ -10,3 +10,4 @@ streamlit
 sqlalchemy
 mysql-connector-python
 tqdm
+python-docx

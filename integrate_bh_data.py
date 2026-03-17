@@ -16,10 +16,10 @@ def clean_currency(value):
 from thefuzz import fuzz, process
 
 def integrate_bh_data(json_file='bh_box_office_data.json', csv_file='movie_features_safe.csv'):
-    print(f"🔄 Integrating data from {json_file} into {csv_file}...")
+    print (f"🔄 Integrating data from {json_file} into {csv_file}...")
     
     if not os.path.exists(json_file):
-        print(f"❌ JSON file not found: {json_file}")
+        print(f"❌ JSON file not found:  {json_file}")
         return
     
     with open(json_file, 'r', encoding='utf-8') as f:
